@@ -523,4 +523,346 @@ class DiffusionSchedule:
         self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
 
+# ----------------------------
+# Training helpers (PyTorch)
+# ----------------------------
+
+def train_text_to_audio(cfg: Config, epochs: int, batch_size: int):
+    set_seed(cfg.seed)
+    ds = TextAudioDataset(cfg.text_audio_csv, cfg.sr, cfg.audio_seconds)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=cfg.num_workers)
+
+    text_enc = TextEncoder(cfg).to(cfg.device)
+    audio_gen = AudioGenerator(cfg).to(cfg.device)
+    audio_enc = TinyAudioEncoder(cfg).to(cfg.device)
+    fusion = FusionBridge(cfg).to(cfg.device)
+
+    opt = torch.optim.Adam(list(text_enc.parameters()) +
+                           list(audio_gen.parameters()) +
+                           list(audio_enc.parameters()) +
+                           list(fusion.parameters()), lr=cfg.lr)
+
+    contrast = InfoNCE()
+
+    steps = 0
+    for ep in range(epochs):
+        for batch in dl:
+            texts, wav = batch  # texts: list[str], wav: [B,T]
+            wav = wav.to(cfg.device)
+            B, T = wav.shape
+
+            # 1) text → shared latent
+            z_text = text_enc(list(texts))  # [B,D]
+            z_shared = fusion.text_latent(z_text)  # [B,D]
+
+            # 2) audio generation (teacher-forced objective: reconstruct wav from noise + cond)
+            noise = torch.randn(B, 1, T, device=cfg.device)
+            wav_pred = audio_gen(noise, z_shared).squeeze(1)  # [B,T]
+            recon_loss = F.l1_loss(wav_pred, wav)
+
+            # 3) contrastive align text and audio latents
+            z_audio = audio_enc(wav)  # [B,D]
+            loss_cl = contrast(z_shared, z_audio)
+
+            loss = recon_loss + 0.1 * loss_cl
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(list(audio_gen.parameters()), 1.0)
+            opt.step()
+
+            if steps % 10 == 0:
+                print(f"[text2audio] ep {ep} step {steps} loss {loss.item():.4f} (recon {recon_loss.item():.4f} cl {loss_cl.item():.4f})")
+            steps += 1
+
+        # save lightweight checkpoint
+        torch.save({
+            'text_enc': text_enc.state_dict(),
+            'audio_gen': audio_gen.state_dict(),
+            'audio_enc': audio_enc.state_dict(),
+            'fusion': fusion.state_dict(),
+            'cfg': cfg.__dict__
+        }, os.path.join(cfg.ckpt_dir, f"text2audio_ep{ep}.pt"))
+
+
+# ----------------------------
+# Training helpers (TF/Keras)
+# ----------------------------
+
+def train_audio_to_image(cfg: Config, epochs: int, batch_size: int):
+    set_seed(cfg.seed)
+    ds = AudioImageDataset(cfg.audio_image_csv, cfg.sr, cfg.audio_seconds, cfg.image_size)
+    # We will iterate dataset in Python and feed TF; for real training, build tf.data.
+
+    schedule = DiffusionSchedule(cfg, cfg.diffusion_timesteps)
+    unet = make_unet(cfg, cfg.image_size, cfg.im_condition_dim)
+    opt = keras.optimizers.Adam(cfg.lr)
+
+    # Audio encoder to produce conditions (PyTorch — will run on CPU/GPU and feed numpy)
+    audio_enc = TinyAudioEncoder(cfg).to(cfg.device).eval()
+    for p in audio_enc.parameters():
+        p.requires_grad = False
+
+    @tf.function
+    def train_step(x0, t, cond, noise):
+        with tf.GradientTape() as tape:
+            # forward diffusion x_t = sqrt(a_bar)*x0 + sqrt(1-a_bar)*noise
+            a_bar = tf.gather(schedule.alphas_cumprod, t)
+            a_bar = tf.reshape(a_bar, (-1, 1, 1, 1))
+            x_t = tf.sqrt(a_bar) * x0 + tf.sqrt(1.0 - a_bar) * noise
+            eps_pred = unet([x_t, tf.reshape(t, (-1, 1)), cond])
+            loss = tf.reduce_mean(tf.square(eps_pred - noise))
+        grads = tape.gradient(loss, unet.trainable_variables)
+        opt.apply_gradients(zip(grads, unet.trainable_variables))
+        return loss
+
+    steps = 0
+    for ep in range(epochs):
+        # simple Python loop dataloader
+        idxs = list(range(len(ds)))
+        random.shuffle(idxs)
+        for i in range(0, len(idxs), batch_size):
+            batch_idx = idxs[i:i+batch_size]
+            if not batch_idx:
+                continue
+            wavs = []
+            imgs = []
+            for j in batch_idx:
+                w, im = ds[j]
+                wavs.append(w.unsqueeze(0))
+                imgs.append(im.unsqueeze(0))
+            wavs = torch.cat(wavs, dim=0).to(cfg.device)  # [B, T]
+            imgs = torch.cat(imgs, dim=0).cpu().numpy()   # [B,3,H,W]
+            imgs = np.transpose(imgs, (0, 2, 3, 1)).astype(np.float32)
+
+            with torch.no_grad():
+                z_audio = audio_enc(wavs).cpu().numpy()  # [B,D]
+            B = imgs.shape[0]
+            t = np.random.randint(0, schedule.timesteps, size=(B,), dtype=np.int32)
+            noise = np.random.randn(*imgs.shape).astype(np.float32)
+
+            loss = train_step(tf.convert_to_tensor(imgs),
+                              tf.convert_to_tensor(t),
+                              tf.convert_to_tensor(z_audio),
+                              tf.convert_to_tensor(noise))
+            if steps % 10 == 0:
+                print(f"[audio2image] ep {ep} step {steps} loss {float(loss):.4f}")
+            steps += 1
+
+        unet.save(os.path.join(cfg.ckpt_dir, f"image_unet_ep{ep}.keras"))
+
+
+# ----------------------------
+# Joint fusion finetuning (align text↔audio↔image)
+# ----------------------------
+
+def train_fusion(cfg: Config, epochs: int, batch_size: int):
+    set_seed(cfg.seed)
+    # use text-audio pairs for alignment and simple image regularization if available
+    ta_ds = TextAudioDataset(cfg.text_audio_csv, cfg.sr, cfg.audio_seconds)
+    ti_dl = DataLoader(ta_ds, batch_size=batch_size, shuffle=True, num_workers=cfg.num_workers)
+
+    text_enc = TextEncoder(cfg).to(cfg.device)
+    audio_enc = TinyAudioEncoder(cfg).to(cfg.device)
+    fusion = FusionBridge(cfg).to(cfg.device)
+
+    opt = torch.optim.Adam(list(text_enc.parameters()) + list(audio_enc.parameters()) + list(fusion.parameters()), lr=cfg.lr)
+    contrast = InfoNCE()
+
+    steps = 0
+    for ep in range(epochs):
+        for batch in ti_dl:
+            texts, wav = batch
+            wav = wav.to(cfg.device)
+            z_text = text_enc(list(texts))
+            z_audio = audio_enc(wav)
+            z_t_shared = fusion.text_latent(z_text)
+            z_a_shared = fusion.audio_latent(z_audio)
+
+            loss_align = contrast(z_t_shared, z_a_shared)
+
+            opt.zero_grad()
+            loss_align.backward()
+            opt.step()
+
+            if steps % 10 == 0:
+                print(f"[fusion] ep {ep} step {steps} align {loss_align.item():.4f}")
+            steps += 1
+
+        torch.save({
+            'text_enc': text_enc.state_dict(),
+            'audio_enc': audio_enc.state_dict(),
+            'fusion': fusion.state_dict(),
+            'cfg': cfg.__dict__
+        }, os.path.join(cfg.ckpt_dir, f"fusion_ep{ep}.pt"))
+
+
+# ----------------------------
+# Inference: lyrics→music (PyTorch)
+# ----------------------------
+@torch.no_grad()
+def infer_lyrics_to_music(cfg: Config, lyrics: str, out_wav: str, ckpt: Optional[str] = None):
+    text_enc = TextEncoder(cfg).to(cfg.device).eval()
+    audio_gen = AudioGenerator(cfg).to(cfg.device).eval()
+    fusion = FusionBridge(cfg).to(cfg.device).eval()
+
+    # Optionally load ckpt
+    if ckpt and os.path.exists(ckpt):
+        state = torch.load(ckpt, map_location=cfg.device)
+        text_enc.load_state_dict(state['text_enc'])
+        audio_gen.load_state_dict(state['audio_gen'])
+        fusion.load_state_dict(state['fusion'])
+
+    T = seconds_to_samples(cfg.audio_seconds, cfg.sr)
+    z_text = text_enc([lyrics])
+    z_shared = fusion.text_latent(z_text)
+
+    noise = torch.randn(1, 1, T, device=cfg.device)
+    wav = audio_gen(noise, z_shared).cpu().numpy()[0, 0]
+    save_wav(out_wav, wav, cfg.sr)
+    print(f"Saved: {out_wav}")
+
+
+# ----------------------------
+# Inference: music→art and lyrics→art (TF diffusion sampling)
+# ----------------------------
+
+def p_sample_img(unet, x_t, t, cond, schedule: DiffusionSchedule):
+    # Predict epsilon
+    t_tensor = tf.convert_to_tensor(np.array([t] * x_t.shape[0], dtype=np.int32))
+    eps = unet([x_t, tf.reshape(t_tensor, (-1, 1)), cond])
+
+    beta_t = schedule.betas[t]
+    alpha_t = schedule.alphas[t]
+    a_bar_t = schedule.alphas_cumprod[t]
+
+    coef1 = 1.0 / math.sqrt(alpha_t)
+    coef2 = (1 - alpha_t) / math.sqrt(1 - a_bar_t)
+    mean = coef1 * (x_t - coef2 * eps)
+
+    if t > 0:
+        noise = tf.random.normal(shape=x_t.shape)
+        sigma = math.sqrt(beta_t)
+        return mean + sigma * noise
+    else:
+        return mean
+
+
+def sample_image(cfg: Config, cond_vec: np.ndarray, out_png: str, ckpt_keras: Optional[str] = None):
+    # Load UNet
+    if ckpt_keras and os.path.exists(ckpt_keras):
+        unet = keras.models.load_model(ckpt_keras, compile=False)
+    else:
+        unet = make_unet(cfg, cfg.image_size, cfg.im_condition_dim)
+
+    schedule = DiffusionSchedule(cfg, cfg.diffusion_timesteps)
+    B = 1
+    x = tf.random.normal((B, cfg.image_size, cfg.image_size, 3))
+    cond = tf.convert_to_tensor(cond_vec.astype(np.float32))
+
+    for t in reversed(range(schedule.timesteps)):
+        x = p_sample_img(unet, x, t, cond, schedule)
+
+    img = x.numpy()[0]
+    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+    save_png(out_png, img)
+    print(f"Saved: {out_png}")
+
+
+@torch.no_grad()
+def infer_music_to_art(cfg: Config, audio_path: str, out_png: str, keras_ckpt: Optional[str] = None, fusion_pt: Optional[str] = None):
+    # Encode audio with TinyAudioEncoder → shared latent → image condition
+    audio_enc = TinyAudioEncoder(cfg).to(cfg.device).eval()
+    fusion = FusionBridge(cfg).to(cfg.device).eval()
+    if fusion_pt and os.path.exists(fusion_pt):
+        state = torch.load(fusion_pt, map_location=cfg.device)
+        fusion.load_state_dict(state['fusion'])
+
+    wav, sr = torchaudio.load(audio_path)
+    wav = torch.mean(wav, dim=0, keepdim=True)
+    if sr != cfg.sr:
+        wav = torchaudio.functional.resample(wav, sr, cfg.sr)
+    T = seconds_to_samples(cfg.audio_seconds, cfg.sr)
+    if wav.shape[-1] < T:
+        wav = F.pad(wav, (0, T - wav.shape[-1]))
+    elif wav.shape[-1] > T:
+        wav = wav[:, :T]
+
+    z_audio = audio_enc(wav.to(cfg.device))  # [1,D]
+    z_shared = fusion.audio_latent(z_audio)
+    z_img = fusion.image_cond(z_shared).cpu().numpy()  # [1,D]
+
+    sample_image(cfg, z_img, out_png, ckpt_keras=keras_ckpt)
+
+
+@torch.no_grad()
+def infer_lyrics_to_art(cfg: Config, lyrics: str, out_png: str, keras_ckpt: Optional[str] = None, fusion_pt: Optional[str] = None):
+    text_enc = TextEncoder(cfg).to(cfg.device).eval()
+    fusion = FusionBridge(cfg).to(cfg.device).eval()
+    if fusion_pt and os.path.exists(fusion_pt):
+        state = torch.load(fusion_pt, map_location=cfg.device)
+        fusion.load_state_dict(state['fusion'])
+
+    z_text = text_enc([lyrics])
+    z_shared = fusion.text_latent(z_text)
+    z_img = fusion.image_cond(z_shared).cpu().numpy()
+
+    sample_image(cfg, z_img, out_png, ckpt_keras=keras_ckpt)
+
+
+# ----------------------------
+# CLI
+# ----------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--stage', type=str, default='text2audio', choices=['text2audio','audio2image','fusion'])
+    parser.add_argument('--train', action='store_true')
+    parser.add_argument('--epochs', type=int, default=1)
+    parser.add_argument('--batch_size', type=int, default=2)
+
+    parser.add_argument('--infer', type=str, choices=['lyrics2music','music2art','lyrics2art'])
+    parser.add_argument('--lyrics', type=str, default=None)
+    parser.add_argument('--audio', type=str, default=None)
+    parser.add_argument('--out_wav', type=str, default='out.wav')
+    parser.add_argument('--out_png', type=str, default='out.png')
+
+    parser.add_argument('--ckpt_pt', type=str, default=None)
+    parser.add_argument('--ckpt_keras', type=str, default=None)
+
+    args = parser.parse_args()
+    cfg = Config()
+
+    if args.train:
+        if args.stage == 'text2audio':
+            train_text_to_audio(cfg, args.epochs, args.batch_size)
+        elif args.stage == 'audio2image':
+            train_audio_to_image(cfg, args.epochs, args.batch_size)
+        elif args.stage == 'fusion':
+            train_fusion(cfg, args.epochs, args.batch_size)
+        else:
+            raise ValueError('Unknown stage')
+        return
+
+    if args.infer:
+        if args.infer == 'lyrics2music':
+            if not args.lyrics:
+                raise ValueError('--lyrics is required')
+            infer_lyrics_to_music(cfg, args.lyrics, args.out_wav, ckpt=args.ckpt_pt)
+        elif args.infer == 'music2art':
+            if not args.audio:
+                raise ValueError('--audio is required')
+            infer_music_to_art(cfg, args.audio, args.out_png, keras_ckpt=args.ckpt_keras, fusion_pt=args.ckpt_pt)
+        elif args.infer == 'lyrics2art':
+            if not args.lyrics:
+                raise ValueError('--lyrics is required')
+            infer_lyrics_to_art(cfg, args.lyrics, args.out_png, keras_ckpt=args.ckpt_keras, fusion_pt=args.ckpt_pt)
+        return
+
+    # If nothing specified, print help
+    parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
 
